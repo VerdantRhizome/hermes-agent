@@ -38,6 +38,7 @@ import re
 import threading
 import time
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlparse as _urlparse
 
 logger = logging.getLogger(__name__)
 
@@ -188,6 +189,18 @@ def _page_target_ws_url(browser_http_base: str) -> str:
             break
         time.sleep(0.5)
     pages = [t for t in targets if t.get("type") == "page"]
+    # Android reality: Chrome keeps backgrounded/inactive windows' tabs in the
+    # target list with their renderer asleep. Those report `attached: false`.
+    # Prefer attached (live) targets first so we never burn the MAX_PROBES
+    # budget probing hundreds of dead inactive-window tabs before reaching the
+    # one live tab. (See references/android-chrome-cdp-quirks.md.)
+    attached = [t for t in pages if t.get("attached")]
+    if attached:
+        pages = attached
+    elif pages:
+        # No attached page (e.g. all windows backgrounded) — fall back to
+        # probing everything, but keep the live-tab-first ordering below.
+        pass
     # `Target.getTargets` (browser socket) returns the live page targets but, on
     # Android Chrome, does NOT include `webSocketDebuggerUrl` in targetInfos
     # (only the HTTP /json/list does — and that endpoint is polluted with ghost
@@ -224,6 +237,160 @@ def _page_target_ws_url(browser_http_base: str) -> str:
     )
 
 
+def _target_ws_url_for(target_info: Dict[str, Any], browser_http_base: str) -> str:
+    """Derive a page target's WebSocket URL from its targetInfo.
+
+    Android's browser-level socket omits ``webSocketDebuggerUrl`` in targetInfos,
+    so we reconstruct it from ``targetId`` (``/devtools/page/<targetId>``).
+    """
+    if target_info.get("webSocketDebuggerUrl"):
+        return target_info["webSocketDebuggerUrl"]
+    _wss = browser_http_base
+    if _wss.startswith("http://") or _wss.startswith("https://"):
+        _wss = "ws://" + _urlparse(browser_http_base).netloc + "/devtools/browser"
+    host = _wss.split("/devtools/browser", 1)[0].replace("ws://", "")
+    return f"ws://{host}/devtools/page/{target_info['targetId']}"
+
+
+def _browser_socket_targets(browser_http_base: str) -> List[Dict[str, Any]]:
+    """Live page targetInfos from the browser-level ``Target.getTargets``, with retries.
+
+    Returns only page-type targets. Does NOT probe responsiveness (callers that
+    act on a target must connect + probe themselves).
+    """
+    browser_ws = browser_http_base
+    if browser_ws.startswith("http://") or browser_ws.startswith("https://"):
+        browser_ws = "ws://" + _urlparse(browser_http_base).netloc + "/devtools/browser"
+    host = browser_ws.split("/devtools/browser", 1)[0].replace("ws://", "")
+    targets: List[Dict[str, Any]] = []
+    for _attempt in range(5):
+        try:
+            bsock = ws_connect(browser_ws, max_size=None, open_timeout=10,
+                               close_timeout=5, ping_interval=None)
+            try:
+                bsock.send(json.dumps({"id": 1, "method": "Target.getTargets"}))
+                while True:
+                    r = json.loads(bsock.recv(timeout=10))
+                    if r.get("id") == 1:
+                        targets = r.get("result", {}).get("targetInfos", [])
+                        break
+            finally:
+                bsock.close()
+        except Exception:
+            targets = []
+        if targets:
+            break
+        time.sleep(0.5)
+    pages = [t for t in targets if t.get("type") == "page"]
+    out: List[Dict[str, Any]] = []
+    for t in pages:
+        if not t.get("webSocketDebuggerUrl"):
+            t = dict(t)
+            t["webSocketDebuggerUrl"] = f"ws://{host}/devtools/page/{t['targetId']}"
+        out.append(t)
+    return out
+
+
+def _refresh_visible_tab(browser_http_base: str) -> Optional[Dict[str, Any]]:
+    """Resolve the visible (on-screen) page target across all reachable page targets.
+
+    Checks ``document.visibilityState === 'visible'`` on each reachable http(s)
+    page target and returns the visible one. Non-content targets (chrome-native,
+    chrome-error, about:blank) are skipped. The visible tab is the programmatic
+    ground truth for "what the user is actually looking at" behind a screenshot
+    (screenshots via ``computer_use`` / D10B-0x404 are unreliable for reading text).
+
+    Chrome must be foregrounded for CDP to be up at all (the ``chrome_devtools_remote``
+    socket is suspended when Chrome is backgrounded on Android). When that holds,
+    this returns the live tab the user sees.
+    """
+    ws = browser_http_base
+    if ws.startswith("http://") or ws.startswith("https://"):
+        ws = "ws://" + _urlparse(ws).netloc + "/devtools/browser"
+    host = ws.split("/devtools/browser", 1)[0].replace("ws://", "")
+    targets = _browser_socket_targets(browser_http_base=ws)
+    if not targets:
+        return None
+    candidates = [t for t in targets if t.get("attached")] or targets
+    for t in candidates:
+        tid = t.get("targetId")
+        if not tid:
+            continue
+        turl = (t.get("url") or "").lower()
+        if turl.startswith("chrome-native://") or turl.startswith("chrome-error://") or turl == "about:blank":
+            continue
+        t_ws_url = _target_ws_url_for(t, browser_http_base)
+        try:
+            _ws = ws_connect(t_ws_url, max_size=None, open_timeout=5, close_timeout=2, ping_interval=None)
+        except Exception:
+            continue
+        try:
+            try:
+                _rpc(_ws, "Runtime.enable", timeout=5)
+            except Exception:
+                pass
+            try:
+                res = _rpc(_ws, "Runtime.evaluate",
+                          {"expression": "document.visibilityState", "returnByValue": True},
+                          timeout=5)
+                vis = res.get("result", {}).get("value")
+                if vis == "visible":
+                    return {"targetId": tid, "url": t.get("url") or "", "title": t.get("title", ""),
+                            "ws_url": t_ws_url}
+            except Exception:
+                pass
+        finally:
+            try:
+                _ws.close()
+            except Exception:
+                pass
+    return None
+
+
+def _resolve_tab_by_url(browser_http_base: str, url: str) -> Optional[str]:
+    """Return the ``targetId`` of a page target whose URL starts with ``url``."""
+    for t in _browser_socket_targets(browser_http_base):
+        turl = (t.get("url") or "")
+        if turl.startswith(url):
+            return t.get("targetId")
+    return None
+
+
+def _background_tab_ws(browser_http_base: str) -> Optional[str]:
+    """Return a page-target WebSocket URL for a tab that is NOT the visible one.
+
+    Used so mutating operations (navigate/click/fill) can target a background tab
+    and leave the on-screen tab untouched. Returns None when every page target is
+    either the visible tab or unreachable. Prefers an attached (live) background
+    tab if any exist.
+    """
+    visible = _refresh_visible_tab(browser_http_base)
+    vis_tid = visible.get("targetId") if visible else None
+    if browser_http_base.startswith("http://") or browser_http_base.startswith("https://"):
+        _wss = "ws://" + _urlparse(browser_http_base).netloc + "/devtools/browser"
+    else:
+        _wss = browser_http_base
+    host = _wss.split("/devtools/browser", 1)[0].replace("ws://", "")
+    for t in _browser_socket_targets(browser_http_base):
+        tid = t.get("targetId")
+        if not tid or tid == vis_tid:
+            continue
+        turl = (t.get("url") or "").lower()
+        if turl.startswith("chrome-native://") or turl.startswith("chrome-error://") or turl == "about:blank":
+            continue
+        if t.get("attached"):
+            return f"ws://{host}/devtools/page/{tid}"
+    # Fallback: any non-visible http page target.
+    for t in _browser_socket_targets(browser_http_base):
+        tid = t.get("targetId")
+        if not tid or tid == vis_tid:
+            continue
+        turl = (t.get("url") or "").lower()
+        if turl.startswith("http"):
+            return f"ws://{host}/devtools/page/{tid}"
+    return None
+
+
 def _is_error_url(url: str) -> bool:
     return url.startswith("chrome-error://") or url.startswith("chrome-native://") \
         or url == "about:blank"
@@ -243,7 +410,15 @@ def _get_or_create_session(task_id: str, browser_ws: str,
     # Tab") and attaching via the browser-level socket yields a session that
     # Chrome rejects ("Session ... not found"). The robust path is to connect
     # directly to a page target's own WebSocket (implicit session).
-    page_ws = _page_target_ws_url(browser_ws)
+    #
+    # ``browser_ws`` may be either a browser-base URL (http(s) or ws://.../devtools/browser)
+    # — in which case we must resolve a page target — or an already-resolved
+    # page-target WebSocket (ws://.../devtools/page/<targetId>), in which case
+    # we use it directly.
+    if "/devtools/page/" in browser_ws or "/devtools/page?" in browser_ws:
+        page_ws = browser_ws
+    else:
+        page_ws = _page_target_ws_url(browser_ws)
     ws = _connect(page_ws)
     try:
         _rpc(ws, "Page.enable")
@@ -710,21 +885,93 @@ _DISPATCH = {
 }
 
 
-def run_raw_cdp_command(task_id: str, command: str, args: List[str],
-                        browser_ws: str, timeout: float = 30.0) -> Dict[str, Any]:
+def run_raw_cdp_command(
+    task_id: str,
+    command: str,
+    args: List[str],
+    browser_ws: str,
+    timeout: float = 30.0,
+    target_url: Optional[str] = None,
+    target_id: Optional[str] = None,
+    on_visible: bool = False,
+    prefer_background: bool = False,
+    target_ws_url: Optional[str] = None,
+) -> Dict[str, Any]:
     """Execute a high-level browser command against the raw CDP endpoint.
 
     Returns the same shape as agent-browser: ``{"success", "data", "error"}``.
+
+    Extended params (all optional, ignored by the cloud/Browserbase path):
+
+    * ``target_url`` — attach to a tab whose URL starts with this value, else
+      fall back to the default task session.
+    * ``target_id`` — attach to this exact ``targetId``, else fall back.
+    * ``on_visible`` — operate on the visible (on-screen) tab; raises if none is
+      reachable (Chrome must be foregrounded for the visible tab to be responsive).
+    * ``prefer_background`` — prefer a background tab so mutating operations
+      (navigate/click/fill) don't disturb the on-screen tab; read-only ops
+      default to the visible tab.
+    * ``target_ws_url`` — explicit page-target WebSocket URL (for callers that
+      already resolved the target by ID/URL).
     """
     handler = _DISPATCH.get(command)
     if handler is None:
         return {"success": False, "error": f"raw-cdp: unsupported command {command!r}"}
 
     browser_ws = _normalize_ws(browser_ws)
+    resolved_ws = browser_ws
+    sess_kwargs: Dict[str, Any] = {}
+
+    if target_ws_url:
+        resolved_ws = target_ws_url
+    elif on_visible:
+        visible = _refresh_visible_tab(browser_ws)
+        if visible is None:
+            return {"success": False,
+                    "error": "No visible (on-screen) tab reachable. Chrome must be foregrounded for CDP to respond to the visible tab."}
+        resolved_ws = visible["ws_url"]
+        sess_kwargs["target_id"] = visible["targetId"]
+    elif target_url:
+        tid = _resolve_tab_by_url(browser_ws, target_url)
+        if tid:
+            tinfo = next((t for t in _browser_socket_targets(browser_ws)
+                          if t.get("targetId") == tid), None)
+            if tinfo:
+                resolved_ws = _target_ws_url_for(tinfo, browser_ws)
+            sess_kwargs["target_id"] = tid
+    elif target_id:
+        tinfo = next((t for t in _browser_socket_targets(browser_ws)
+                      if t.get("targetId") == target_id), None)
+        if tinfo:
+            resolved_ws = _target_ws_url_for(tinfo, browser_ws)
+            sess_kwargs["target_id"] = target_id
+    elif prefer_background:
+        resolved_ws = _background_tab_ws(browser_ws)
+        if resolved_ws is None:
+            visible = _refresh_visible_tab(browser_ws)
+            if visible is None:
+                return {"success": False,
+                        "error": "No responsive background tab and no visible tab reachable."}
+            resolved_ws = visible["ws_url"]
+            sess_kwargs["target_id"] = visible["targetId"]
+
+    target_id_val = sess_kwargs.get("target_id")
+
+    def _run(ws, sess):
+        return handler(ws, sess, args)
+
+    with _SESSIONS_LOCK:
+        existing = _SESSIONS.get(task_id)
+        if existing is not None and not resolved_ws:
+            sess = existing
+        elif resolved_ws:
+            sess = _TaskSession(resolved_ws, target_id_val or resolved_ws, "")
+            _SESSIONS[task_id] = sess
+        else:
+            sess = _get_or_create_session(task_id, browser_ws)
+
     try:
-        def _run(ws, sess):
-            return handler(ws, sess, args)
-        return _with_session(task_id, browser_ws, _run)
+        return _with_session(task_id, resolved_ws or browser_ws, _run)
     except Exception as e:
         logger.warning("raw-cdp %s failed: %s", command, e)
         return {"success": False, "error": f"raw-cdp {command}: {e}"}

@@ -2443,6 +2443,7 @@ def _run_browser_command(
     args: List[str] = None,
     timeout: Optional[int] = None,
     _engine_override: Optional[str] = None,
+    **kwargs,
 ) -> Dict[str, Any]:
     """
     Run an agent-browser CLI command using our pre-created Browserbase session.
@@ -2480,6 +2481,7 @@ def _run_browser_command(
             from tools.browser_raw_cdp import run_raw_cdp_command
             return run_raw_cdp_command(
                 task_id, command, args, _cdp_override, timeout=timeout or 30.0,
+                **kwargs,
             )
 
     # Build the command
