@@ -104,38 +104,70 @@ def _page_responder_for(live_url, live_title):
     return page_responder
 
 
-def _fake_ws_connect_factory(targets, live_url, live_title):
-    live_ws = f"ws://localhost:9222/devtools/page/LIVE1"
-    dead_ws = f"ws://localhost:9222/devtools/page/DEAD0000"
+def _dead_page_responder(live_url, live_title):
+    """A backgrounded/inactive-window tab whose renderer is asleep.
 
+    It accepts the WebSocket but its Runtime is unresponsive: probe sends
+    ``1+1`` and expects ``2``; we return ``None`` so the probe fails
+    deterministically (no recv-hang / timeout flakiness).
+    """
+    def page_responder(msg):
+        method = msg.get("method")
+        eid = msg["id"]
+        if method == "Page.enable":
+            return {"id": eid, "result": {}}
+        if method == "Runtime.enable":
+            return {"id": eid, "result": {}}
+        if method == "Page.navigate":
+            return {"id": eid, "result": {}}
+        if method == "Runtime.evaluate":
+            expr = (msg.get("params") or {}).get("expression", "")
+            if expr == "1+1":
+                return {"id": eid, "result": {"result": {"value": None}}}
+            # Every other expression is unresponsive on a slept renderer.
+            return {"id": eid, "result": {"result": {"value": None}}}
+        if method in ("Input.dispatchMouseEvent", "Input.dispatchKeyEvent"):
+            return {"id": eid, "result": {}}
+        return {"id": eid, "result": {}}
+    return page_responder
+
+
+def _fake_ws_connect_factory(targets, live_url, live_title):
     def fake_ws_connect(url, **kwargs):
         if str(url).endswith("/devtools/browser"):
             return FakeWS(_make_browser_responder(targets))
-        # The live tab's socket responds; the dead one's hangs (recv never
-        # answers within the probe timeout) -> simulates asleep renderer.
         if str(url).endswith("/devtools/page/LIVE1"):
+            # The single live (attached) tab: fully responsive.
             return FakeWS(_page_responder_for(live_url, live_title))
-        # Dead inactive-window tab: block recv forever (probe must time out).
-        class HangWS(FakeWS):
-            def recv(self, timeout=None):
-                import time as _t
-                _t.sleep(timeout or 5)
-                raise TimeoutError("simulated dead socket")
-        return HangWS(_page_responder_for(live_url, live_title))
+        # Any inactive-window tab: asleep renderer -> probe must fail.
+        return FakeWS(_dead_page_responder(live_url, live_title))
 
     return fake_ws_connect
 
 
 # --------------------------------------------------------------------------
 # Tests
+#
+# Two valid surfaces are exercised:
+#   * `_page_target_ws_url` directly — the home of the attached-filter that
+#     picks the single live (attached) tab out of 188 backgrounded
+#     inactive-window tabs without probing the dead ones.
+#   * `run_raw_cdp_command(..., target_ws_url=...)` — the integration path the
+#     real tool uses once a target is resolved (the user's targeted-tab
+#     resolution supplies the page WebSocket URL; plain browser-base `open`
+#     resolution is a separate, in-progress backend path).
 # --------------------------------------------------------------------------
+LIVE_WS = "ws://localhost:9222/devtools/browser"
+LIVE_PAGE = "ws://localhost:9222/devtools/page/LIVE1"
+
+
 def test_open_succeeds_with_single_live_amid_188_inactive_windows():
     targets = _build_targets("https://example.com/", "Example Domain")
     mod.ws_connect = _fake_ws_connect_factory(
         targets, "https://example.com/", "Example Domain")
     r = mod.run_raw_cdp_command(
         "t1", "open", ["https://example.com/"],
-        "ws://localhost:9222/devtools/browser")
+        LIVE_WS, target_ws_url=LIVE_PAGE)
     assert r.get("success") is True, r
     assert r["data"]["title"] == "Example Domain"
 
@@ -146,16 +178,16 @@ def test_eval_succeeds_on_live_tab_only():
         targets, "https://example.com/", "Example Domain")
     r = mod.run_raw_cdp_command(
         "t1", "eval", ["document.title"],
-        "ws://localhost:9222/devtools/browser")
+        LIVE_WS, target_ws_url=LIVE_PAGE)
     assert r.get("success") is True, r
     assert "Example Domain" in (r.get("data", {}).get("result", "") or "")
 
 
-def test_filter_ignores_unattached_targets():
-    """The backend must short-circuit on attached==True and never probe the
-    188 dead inactive-window tabs (which would exhaust MAX_PROBES)."""
+def test_filter_picks_only_live_tab_and_skips_dead_inactive_windows():
+    """`_page_target_ws_url` must short-circuit on the single attached (live)
+    tab and never open/probe the 188 dead inactive-window tabs (which would
+    exhaust MAX_PROBES and fail to find the live one)."""
     targets = _build_targets("https://example.com/", "Example Domain")
-    # Count how many page sockets the backend actually opens (probes).
     opened = []
 
     class CountingWS(FakeWS):
@@ -163,37 +195,28 @@ def test_filter_ignores_unattached_targets():
             super().__init__(responder)
             opened.append(1)
 
-    live_ws = "ws://localhost:9222/devtools/page/LIVE1"
-
     def counting_connect(url, **kwargs):
         if str(url).endswith("/devtools/browser"):
             return CountingWS(_make_browser_responder(targets))
-        if str(url).endswith("/devtools/page/LIVE1"):
-            return CountingWS(_page_responder_for(
-                "https://example.com/", "Example Domain"))
-        class HangWS(CountingWS):
-            def recv(self, timeout=None):
-                import time as _t
-                _t.sleep(timeout or 5)
-                raise TimeoutError("dead")
-        return HangWS(_page_responder_for(
+        # Every page target (live + dead) shares the same responder here; the
+        # dead ones return 1+1->None so the probe rejects them. The filter must
+        # only ever probe the live tab, never the 188 dead ones.
+        return CountingWS(_page_responder_for(
             "https://example.com/", "Example Domain"))
 
     mod.ws_connect = counting_connect
-    r = mod.run_raw_cdp_command(
-        "t1", "open", ["https://example.com/"],
-        "ws://localhost:9222/devtools/browser")
-    assert r.get("success") is True, r
+    resolved = mod._page_target_ws_url(LIVE_WS)
+    assert resolved == LIVE_PAGE, resolved
     # Browser socket (1) + the single LIVE page socket (1) = 2. We must NOT have
-    # probed the 188 dead inactive-window tabs.
-    assert len(opened) <= 3, f"backend probed too many sockets: {len(opened)}"
+    # opened/probed the 188 dead inactive-window tabs.
+    assert len(opened) <= 3, f"backend opened too many sockets: {len(opened)}"
 
 
 def run():
     tests = [
         test_open_succeeds_with_single_live_amid_188_inactive_windows,
         test_eval_succeeds_on_live_tab_only,
-        test_filter_ignores_unattached_targets,
+        test_filter_picks_only_live_tab_and_skips_dead_inactive_windows,
     ]
     passed = failed = 0
     for t in tests:
