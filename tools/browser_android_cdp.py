@@ -919,7 +919,14 @@ def run_raw_cdp_command(
         return {"success": False, "error": f"raw-cdp: unsupported command {command!r}"}
 
     browser_ws = _normalize_ws(browser_ws)
-    resolved_ws = browser_ws
+    # No target param: leave resolved_ws falsy so the dispatch below routes
+    # through the session machinery (_get_or_create_session), which resolves a
+    # live PAGE target via probing. Defaulting to the browser-level socket here
+    # was a regression: the browser socket has no DOM/Runtime domains, so every
+    # bare command (the path the high-level tools actually use) failed with
+    # -32601 "DOM.getDocument wasn't found" (see regression test
+    # "bare default path ..." in test_browser_android_cdp_targeted.py).
+    resolved_ws: Optional[str] = None
     sess_kwargs: Dict[str, Any] = {}
 
     if target_ws_url:
@@ -962,13 +969,16 @@ def run_raw_cdp_command(
 
     with _SESSIONS_LOCK:
         existing = _SESSIONS.get(task_id)
-        if existing is not None and not resolved_ws:
-            sess = existing
-        elif resolved_ws:
-            sess = _TaskSession(resolved_ws, target_id_val or resolved_ws, "")
+    if existing is not None and not resolved_ws:
+        sess = existing
+    elif resolved_ws:
+        sess = _TaskSession(resolved_ws, target_id_val or resolved_ws, "")
+        with _SESSIONS_LOCK:
             _SESSIONS[task_id] = sess
-        else:
-            sess = _get_or_create_session(task_id, browser_ws)
+    else:
+        # _get_or_create_session takes _SESSIONS_LOCK itself (double-checked
+        # create) — must NOT be called while we hold it (non-reentrant lock).
+        sess = _get_or_create_session(task_id, browser_ws)
 
     try:
         return _with_session(task_id, resolved_ws or browser_ws, _run)
@@ -982,5 +992,10 @@ def _normalize_ws(url: str) -> str:
     if url.startswith("ws://") or url.startswith("wss://"):
         return url
     import urllib.request
-    with urllib.request.urlopen(url, timeout=3) as r:
+    # A bare http(s) base serves the devtools frontend, not JSON — always hit
+    # the /json/version discovery endpoint (mirrors _resolve_cdp_override).
+    version_url = (
+        url if url.endswith("/json/version") else url.rstrip("/") + "/json/version"
+    )
+    with urllib.request.urlopen(version_url, timeout=3) as r:
         return json.loads(r.read())["webSocketDebuggerUrl"]

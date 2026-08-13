@@ -32,9 +32,11 @@ jobs:
       - name: Install websockets
         run: python -m pip install --upgrade pip websockets
       - name: Smoke parse of the raw CDP backend
-        run: python -c "import ast; ast.parse(open('tools/browser_raw_cdp.py').read()); print('parse ok')"
+        run: python -c "import ast; ast.parse(open('tools/browser_android_cdp.py').read()); print('parse ok')"
       - name: Run deterministic mock E2E
-        run: python tools/tests/test_browser_raw_cdp_mock.py 2>&1 | tail -5
+        run: |
+          python tools/tests/test_browser_android_cdp_targeted.py 2>&1 | tail -3
+          python tools/tests/test_browser_android_cdp_inactive_windows.py 2>&1 | tail -3
 
   live-e2e:
     name: live E2E (Android Chrome via CDP)

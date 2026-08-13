@@ -2680,6 +2680,17 @@ def _extract_screenshot_path_from_text(text: str) -> Optional[str]:
     return None
 
 
+def _is_android_cdp_mode() -> bool:
+    """True when a CDP override is configured AND running under Termux/Android.
+
+    The raw backend exists because agent-browser cannot run on android-arm64
+    ("Unsupported platform"). On desktop/server, ``browser.cdp_url`` flows
+    through main's agent-browser machinery (which supports cdp_url there) — do
+    not hijack it; this guard keeps the two worlds separate.
+    """
+    return bool(_get_cdp_override_raw()) and _is_termux_environment()
+
+
 def _run_browser_command(
     task_id: str,
     command: str,
@@ -2709,19 +2720,22 @@ def _run_browser_command(
     args = args or []
 
     # ── Raw CDP override (android-arm64 / Termux safe) ──────────────────────
-    # When ``browser.cdp_url`` (or BROWSER_CDP_URL) is configured, drive Chrome
-    # directly over the DevTools Protocol WebSocket. This bypasses the
-    # agent-browser Node subprocess, which cannot run on platforms like
-    # android-arm64 ("Unsupported platform: android-arm64"). The raw backend
-    # implements the same command vocabulary and return shape as agent-browser,
-    # so every high-level tool (navigate/snapshot/click/type/vision/...) works.
+    # When running under Termux with ``browser.cdp_url`` (or BROWSER_CDP_URL)
+    # configured, drive Chrome directly over the DevTools Protocol WebSocket.
+    # This bypasses the agent-browser Node subprocess, which cannot run on
+    # platforms like android-arm64 ("Unsupported platform: android-arm64"). The
+    # raw backend implements the same command vocabulary and return shape as
+    # agent-browser, so every high-level tool
+    # (navigate/snapshot/click/type/vision/...) works. Gated on Termux
+    # (_is_android_cdp_mode) so desktop/server cdp_url flows keep using main's
+    # agent-browser machinery.
     # NOTE: this must run *before* the agent-browser session machinery below,
     # which is why we don't reference ``session_info`` here (it isn't built
     # until later).
-    if not _is_camofox_mode():
+    if _is_android_cdp_mode():
         _cdp_override = _get_cdp_override()
         if _cdp_override:
-            from tools.browser_raw_cdp import run_raw_cdp_command
+            from tools.browser_android_cdp import run_raw_cdp_command
             return run_raw_cdp_command(
                 task_id, command, args, _cdp_override, timeout=timeout or 30.0,
                 **kwargs,

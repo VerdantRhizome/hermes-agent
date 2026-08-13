@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Deterministic visible-tab + targeted-tab tests for tools/browser_raw_cdp.py.
+"""Deterministic visible-tab + targeted-tab tests for tools/browser_android_cdp.py.
 
 Mocks the CDP transport so the visible-tab / background-tab / by-url resolution
 logic is exercised without a flaky Android Chrome devtools socket. This is the
@@ -19,7 +19,7 @@ for _p in _CANDIDATES:
     if _p not in sys.path and os.path.isdir(os.path.join(_p, "tools")):
         sys.path.insert(0, _p)
 
-import tools.browser_raw_cdp as mod
+import tools.browser_android_cdp as mod
 
 
 class FakeWS:
@@ -276,6 +276,47 @@ def run() -> int:
     r8 = mod.run_raw_cdp_command("t-vis3", "eval", ["document.title"], BWS, on_visible=True)
     check("visible tab still example.com after prefer_background navigate",
           r8.get("success") is True and "Example Domain" in (r8.get("data", {}).get("result", "") or ""))
+
+    # ---- run_raw_cdp_command DEFAULT (bare) path must resolve a PAGE target ----
+    # Regression (found by live comparison on Chrome 151): resolved_ws defaulted
+    # to the browser-level socket, which has no DOM/Runtime domains (live error:
+    # -32601 "DOM.getDocument wasn't found"). The real high-level tools never
+    # pass target params, so the bare path is the one that matters. It must
+    # route through the session machinery (_get_or_create_session) and connect
+    # to a /devtools/page/<id> socket, never command against the browser socket.
+    recorded_urls = []
+    saved_connect = mod.ws_connect
+
+    def browser_socket_limited_responder(state, msg):
+        # Mirrors the live browser socket: Target.* works (discovery), but the
+        # page domains (DOM/Runtime) are not implemented (-32601 live behavior).
+        eid = msg.get("id")
+        if msg.get("method") == "Target.getTargets":
+            return {"id": eid, "result": {"targetInfos": [
+                {"type": "page", "url": "https://example.com/", "targetId": "ex1"},
+                {"type": "page", "url": "https://other.example/", "targetId": "OTH1"},
+            ]}}
+        raise RuntimeError("-32601: 'DOM.getDocument' wasn't found (browser socket)")
+
+    def fake_recording_connect(url, **kwargs):
+        s = str(url)
+        recorded_urls.append(s)
+        if s.endswith("/devtools/browser"):
+            return FakeWS(browser_socket_limited_responder)
+        return FakeWS(page_visible_responder)
+
+    mod.ws_connect = fake_recording_connect
+    rb = mod.run_raw_cdp_command("t-default", "eval", ["document.title"], BWS)
+    mod.ws_connect = saved_connect
+    check("bare default path succeeds (page target resolved, not browser socket)",
+          rb.get("success") is True
+          and "Example Domain" in (rb.get("data", {}).get("result", "") or ""))
+    check("bare default path connected to a /devtools/page/ socket",
+          any("/devtools/page/" in u for u in recorded_urls))
+    check("bare default path did NOT command the browser socket",
+          recorded_urls and all(
+              u.endswith("/devtools/browser") for u in recorded_urls
+          ) is False)
 
     print(f"\n=== {passed}/{passed + failed} checks passed ===")
     return failed

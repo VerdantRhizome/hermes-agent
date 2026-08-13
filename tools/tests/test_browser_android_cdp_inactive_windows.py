@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Inactive-window / saturation resilience test for tools/browser_raw_cdp.py.
+"""Inactive-window / saturation resilience test for tools/browser_android_cdp.py.
 
 Reproduces the real Android Chrome condition this project exists to survive:
 Chrome keeps backgrounded/inactive windows' tabs in the CDP target list with
@@ -27,7 +27,7 @@ for _p in _CANDIDATES:
     if _p not in sys.path and os.path.isdir(os.path.join(_p, "tools")):
         sys.path.insert(0, _p)
 
-import tools.browser_raw_cdp as mod
+import tools.browser_android_cdp as mod
 
 
 # --------------------------------------------------------------------------
