@@ -22,7 +22,7 @@ import sys
 
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 _REPO_ROOT = os.path.dirname(os.path.dirname(_THIS_DIR))
-_CANDIDATES = [_REPO_ROOT, "/data/data/com.termux/files/home/.hermes/hermes-agent"]
+_CANDIDATES = [_REPO_ROOT]
 for _p in _CANDIDATES:
     if _p not in sys.path and os.path.isdir(os.path.join(_p, "tools")):
         sys.path.insert(0, _p)
