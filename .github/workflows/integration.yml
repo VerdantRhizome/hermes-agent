@@ -64,4 +64,4 @@ jobs:
               raise SystemExit(1)
           PY
       - name: Run live high-level E2E
-        run: python /data/data/com.termux/files/usr/tmp/hermes-verify-hl.py
+        run: python tools/scripts/live-verify-hl.py
