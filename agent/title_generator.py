@@ -105,6 +105,24 @@ _TITLE_RESPONSE_FORMAT = {
     },
 }
 
+
+def _is_response_format_rejection(exc: BaseException) -> bool:
+    """Whether the provider refused our ``response_format`` (HTTP 400).
+
+    Providers differ in what structured output they accept: OpenAI and
+    OpenRouter honor ``json_schema``, DeepSeek rejects it with ``400: This
+    response_format type is unavailable now`` (its final-message
+    ``response_format`` only documents ``text`` and ``json_object``). The
+    message scan catches SDK exceptions (which embed the API error body) and
+    stringly errors from non-OpenAI clients; the status check keeps a 5xx
+    that happens to mention response_format out of the retry path.
+    """
+    text = str(exc).lower()
+    if "response_format" not in text:
+        return False
+    status = getattr(exc, "status_code", None)
+    return status is None or status == 400
+
 # Control-tag wrappers that surround machine-authored content inside what is
 # nominally a "user" message. Titling from these is what produces a session
 # named after a slash command or an injected reminder rather than the user's
@@ -392,19 +410,50 @@ def generate_title(
     ]
 
     try:
-        response = call_llm(
-            task="title_generation",
-            messages=messages,
-            # A title is a handful of tokens. The old 500-token ceiling let a
-            # chatty model burn seconds generating prose we then threw away.
-            max_tokens=64,
-            temperature=0.3,
-            timeout=timeout,
-            main_runtime=main_runtime,
-            extra_body={"response_format": _TITLE_RESPONSE_FORMAT},
+        # Response-format ladder: strict ``json_schema`` where the provider
+        # supports it, downgraded to ``json_object`` and then to no
+        # response_format at all for providers that reject the schema form
+        # (DeepSeek's final-message ``response_format`` only documents
+        # ``text`` and ``json_object``, and it answers with HTTP 400 "This
+        # response_format type is unavailable now"). The title prompt already
+        # demands JSON-only output and _extract_title_text parses loosely, so
+        # a downgrade loses nothing but the schema guarantee.
+        response_format_attempts: tuple = (
+            _TITLE_RESPONSE_FORMAT,
+            {"type": "json_object"},
+            None,
         )
-        content = response.choices[0].message.content or ""
-        return _clean_title(_extract_title_text(content))
+        for response_format in response_format_attempts:
+            try:
+                response = call_llm(
+                    task="title_generation",
+                    messages=messages,
+                    # A title is a handful of tokens. The old 500-token
+                    # ceiling let a chatty model burn seconds generating
+                    # prose we then threw away.
+                    max_tokens=64,
+                    temperature=0.3,
+                    timeout=timeout,
+                    main_runtime=main_runtime,
+                    extra_body=(
+                        {"response_format": response_format}
+                        if response_format
+                        else {}
+                    ),
+                )
+                content = response.choices[0].message.content or ""
+                return _clean_title(_extract_title_text(content))
+            except Exception as e:
+                if response_format is not None and _is_response_format_rejection(e):
+                    # Provider refused this response_format form — retry the
+                    # next, downgraded one.
+                    logger.debug(
+                        "Title response_format %r rejected (%s); downgrading",
+                        response_format.get("type"),
+                        e,
+                    )
+                    continue
+                raise
     except Exception as e:
         # Log at WARNING so this shows up in agent.log without debug mode.
         # Full detail at debug level for operators who need the stack.
