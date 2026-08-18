@@ -358,6 +358,80 @@ the design-decision record; items 1-3 are resolved.
 4. **Multi-skill plans** — real workflows chain skills (e.g. FreeCAD skill →
    Blender skill). Out of scope for v0; v0 is single-skill only.
 
+## Addendum (2026-08-19): recovering the portability the plugin-storage move gave up
+
+The plugin-placement resolution (open question #3, above) explicitly traded
+away one property to get zero core surface: a cached plan no longer
+travels automatically with the skill's own directory. That's a real loss
+worth naming plainly, not glossing over:
+
+- A skill shared via `hermes skills install`, a skills-hub publish, or a
+  plain directory copy carries only the `SKILL.md` + `references/`/
+  `templates/`/`scripts/`/`assets/` that already ship with it today.
+  Anything cached in the SPC plugin's `ctx.state` — which is
+  profile-scoped, not skill-scoped, and lives entirely outside the skill's
+  own directory — does **not** travel with that copy. A user who has
+  built up cached plans for `cad-fem-integration-testing` and shares that
+  skill with someone else, or migrates it to another profile without also
+  migrating (or even being aware of) the plugin's state file, hands over a
+  skill that looks and reads identically but silently has none of its
+  accumulated speed/cost benefit. That's a portability regression relative
+  to the original in-tree design, not just a missing nice-to-have.
+
+**Proposed mitigation — write a lightweight signal back into the skill,
+without reintroducing the core dependency that was just removed.** The
+resolution correctly avoided a `skill_manage` core change; it doesn't
+follow that the skill's own directory has to stay completely untouched.
+A plugin can already write into a skill's `references/` folder today using
+the *existing*, already-generic `skill_manage` write path — no allowlist
+extension needed, since `references/` is already one of the four accepted
+subfolders. Concretely, on promotion, in addition to the `ctx.state` write:
+
+- Emit (or update) a small, best-effort, human-readable digest at
+  `references/cached-plan-summary.md` inside the skill's own directory —
+  NOT the full manifest, NOT the executable script, just a concise
+  plain-language description of what got cached and roughly what it does
+  ("this skill has a cached plan for the mesh+solve step, parameterized on
+  mesh size and load magnitude, captured from N successful runs").
+- Append one fixed, greppable line noting the mechanism and where the
+  real artifact lives, e.g.:
+
+  ```
+  > Cached execution plan available via the Skill Plan Cache plugin
+  > (github.com/<org>/hermes-plugin-skill-plan-cache). Install the plugin
+  > and this skill will resume replaying its cached plan automatically;
+  > without it, this file is documentation only and the skill runs by
+  > normal re-derivation.
+  ```
+
+This gets the two properties that matter without reversing the placement
+decision:
+
+- **Portability is restored at the "at least the reader knows" level.**
+  A skill shared or migrated without the plugin installed is no longer
+  silently missing capability — the digest is readable, degrades
+  gracefully (it's just documentation if the plugin isn't present), and
+  tells the next reader (human or agent) exactly what to install to get
+  the full benefit back.
+- **No core dependency reappears.** The write still goes through the
+  existing, generic `skill_manage` `references/` path — nothing new is
+  asked of core. The plugin depends on `skill_manage`'s *existing* surface
+  the same way any skill-authoring workflow already does; it does not
+  require the `cache/`-subfolder extension that was ruled out in question
+  #3's resolution.
+- **The digest is disposable and self-healing.** If it drifts from the
+  real `ctx.state` content (say, promotion happens again with a different
+  plan), the plugin just overwrites the same file — it's a mirror, not a
+  second source of truth. If the plugin is later uninstalled, the digest
+  stays as an inert, accurate historical note rather than a broken
+  reference.
+
+This does not change the placement decision or reopen any of the three
+resolved questions — it's an addendum to how the plugin behaves once
+built, not a redesign. Whether to build this into v0 or treat it as a
+fast-follow once the core capture/replay loop is proven is an open
+implementation-scheduling call, not a design question.
+
 ## Concrete dogfood candidate
 
 The user's own FreeCAD → Gmsh → CalculiX FEA pipeline (`cad-fem-integration-
