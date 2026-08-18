@@ -53,36 +53,54 @@ fingerprint-matched replay path.
 - **Not** general-purpose semantic caching of arbitrary chat turns — that's
   provider-side prompt caching, which Hermes already has
   (`agent/prompt_caching.py`) and is orthogonal to this.
-- **Not** mid-conversation cache mutation. Plan capture/promotion happens at
-  natural boundaries (`on_session_end`, an explicit `/skills cache-plan`
-  command) — never mid-turn, so it cannot invalidate the provider prompt
-  cache the way a rebuilt system prompt would.
+- **Not** mid-conversation cache mutation. Recording happens at
+  `on_session_end`; promotion is checked at the start of a later,
+  separate skill invocation — never mid-turn, so neither step can
+  invalidate the provider prompt cache the way a rebuilt system prompt
+  would.
 
 ## Proposal (v0, scoped for real review)
 
 A **plugin** (Footprint Ladder rung 4) plus a **CLI command** (rung 2). No
 core tool.
 
-### 1. Capture: `on_session_end` hook, opt-in per skill
+### 1. Capture: two separate triggers, not one
 
-The plugin registers `on_session_end`. If the session invoked a skill (skill
-name is already tracked for slash-command telemetry) and the turn sequence
-ends with tool calls that succeeded (no `status: error` in the relevant
-`post_tool_call` events), the plugin proposes — via a normal agent
-follow-up, not a silent background write — promoting the tool-call sequence
-to a cached plan:
+Two distinct decisions were originally conflated under a single
+"propose caching at `on_session_end`" trigger. Once slot identification
+requires diffing across multiple real runs (see open question #2's
+resolution below), a single-run trigger no longer makes sense — capture
+splits into **recording** (cheap, silent, per-run) and **promotion**
+(the point a cached plan actually becomes trustable and replayable).
+Resolved design, see "Open questions" §1 below for the reasoning:
 
-```
-This looks like a repeatable procedure. Save it as a cached plan for
-`cad-fem-integration-testing`? [y/N]
-```
+- **Recording** — `on_session_end`, silent, automatic, gated only on the
+  invoked skill's tool calls all succeeding and the skill having opted in
+  via its own `SKILL.md` frontmatter config. No user prompt. This is
+  cheap evidence-journaling, not a durable/trust-bearing artifact — same
+  posture as the existing plugin state facade (atomic write, quota, no
+  approval needed).
+- **Promotion** — checked lazily, at the *start* of the next invocation of
+  a skill that already has ≥2 recorded successful runs and no promoted
+  plan yet. The agent asks once, inline, before proceeding with the
+  traditional re-derivation:
 
-On confirmation, the plugin extracts an ordered template of tool calls with
-literal task-specific values (paths, numeric params, names) replaced by
-named slots, using the same class of lightweight extraction APC describes
-(a cheap auxiliary-model pass, not the main model) — Hermes already has an
-auxiliary-model config surface (`auxiliary:` in `config.yaml`) this can
-reuse rather than inventing a new one.
+  ```
+  This looks like a repeatable procedure you've run before. Save it as a
+  cached plan for `cad-fem-integration-testing`? [y/N]
+  ```
+
+  On confirmation, the plugin diffs the recorded runs to identify slots
+  (symbolic, not model-judged — see open question #2's resolution) and
+  writes the plan manifest.
+
+This is lazy evaluation at the next natural use point: no new background
+scan job (rejected — speculative infra per `AGENTS.md`), and no
+mid-task interruption for a housekeeping question unrelated to what the
+user is doing right now (rejected — the immediate-at-2nd-run alternative).
+The prompt only ever appears when the user is already about to run that
+exact skill again, so it is contextually relevant rather than a
+context-switch.
 
 ### 2. Storage: inside the skill's own directory, using the existing skill file API
 
@@ -141,15 +159,40 @@ against, not a v0 commitment.
 | 1. Extend existing code | Partially | Reuses `skill_manage` write paths, existing auxiliary-model config, existing approval gates |
 | 2. CLI command + skill | **Yes** | `hermes skills replay` + a short skill-text convention |
 | 3. Service-gated tool | No | Not needed — replay is a shell command, not a structured tool call |
-| 4. Plugin | **Yes** | Capture logic lives entirely in `on_session_end`/`post_tool_call` hooks, in `~/.hermes/plugins/` |
+| 4. Plugin | **Yes** | Recording lives in `on_session_end`/`post_tool_call` hooks; promotion check lives in a pre-invocation hook on skill dispatch, in `~/.hermes/plugins/` |
 | 5. MCP server | No | No cross-host reuse case yet |
 | 6. New core tool | **No** | Explicitly rejected — the whole point is to avoid adding schema weight for a capability most users won't exercise |
 
 ## Open questions to workshop before this goes near upstream
 
-1. **Where does the "propose caching this" prompt live** — is `on_session_end`
-   the right hook, or should capture be a deliberate `/skills cache-plan`
-   command only (fully opt-in, zero automatic proposing) for v0?
+1. ~~**Where does the "propose caching this" prompt live**~~ — **RESOLVED,
+   2026-08-18.** The original framing (a single choice between
+   `on_session_end` auto-proposal vs. a fully manual `/skills cache-plan`
+   command) turned out to conflate two separate decisions that the
+   slot-verification design (question #2, resolved below) already forces
+   apart, since slot identification needs a diff across ≥2 real runs and
+   can't fire off a single session:
+
+   - **Recording** (evidence-journaling, cheap, per-run) happens silently
+     at `on_session_end` whenever an opted-in skill's tool calls all
+     succeeded — no prompt, no promotion, just saving the raw sequence.
+   - **Promotion** (turning ≥2 recorded runs into an actual replayable
+     cached plan) is checked lazily, at the *start* of the next invocation
+     of a skill that already has ≥2 recorded runs and no promoted plan.
+     The agent asks once, inline, right before it would otherwise
+     re-derive the procedure from scratch.
+
+   Two alternatives were considered and rejected: promoting immediately
+   at the 2nd run's `on_session_end` (interrupts the user mid-task with an
+   off-topic housekeeping question at the exact moment they're focused on
+   the real work) and a periodic background scan job (new speculative
+   infra with no concrete consumer yet, against `AGENTS.md`'s explicit
+   guidance). The lazy-at-next-invocation check costs nothing new — it
+   reuses the skill-dispatch path the plugin already has to touch for
+   recording — and the prompt only ever surfaces when the user is already
+   about to run that exact skill again, so it reads as contextually
+   relevant rather than a context-switch. See "1. Capture" above for the
+   updated proposal text.
 2. **Slot extraction quality** — a cheap auxiliary-model pass may mis-slot
    values that look like literals but are load-bearing (e.g. a unit string).
    Needs a concrete eval before trusting it on anything safety-relevant
