@@ -156,6 +156,78 @@ against, not a v0 commitment.
    (see `AGENTS.md` punch-list item #1 — this user has already hit a silent
    unit-misinterpretation bug in a downstream tool; a caching layer must not
    add a second one).
+
+   **Proposed answer — don't let a model guess slots, verify them
+   symbolically first:**
+
+   The single-shot "ask a model which values look like parameters" approach
+   is exactly the shape of failure that produced the FreeCAD unit bug: a
+   model can plausibly mis-generalize a load-bearing constant (a unit
+   string, a solver flag, a precision digit count) as safely swappable data.
+   Don't give the model that judgment call at all where it can be avoided.
+
+   - **Slot *identification* is symbolic, not model-judged.** Require at
+     least two successful captures of the same skill before a plan is
+     eligible for caching at all (this is a `cache` state transition already
+     implicit in the "propose caching" flow in step 1 — a plan needs N≥2
+     real runs before promotion, not one). Anti-unify / AST-diff the two
+     tool-call sequences: **only positions that actually varied across the
+     two real runs are candidate slots.** A value that was constant across
+     every observed run stays a literal, full stop — a model is never asked
+     to guess "is this safe to generalize" on unseen data, because the slot
+     boundary comes from empirical evidence, not inference. This also
+     directly catches the class of bug in punch-list item #1: a unit
+     string (`"MPa"`) is constant across every run of the same skill and
+     therefore is never proposed as a slot; a mesh size or file path that
+     legitimately changes run-to-run is.
+   - **Slot *labeling/naming* (a much lower-stakes task — assigning a
+     human-readable name and JSON schema type to an already-proven slot,
+     not deciding whether it's a slot) is a good fit for a cheap
+     structured-output model call**, since a wrong label is a cosmetic/UX
+     problem, not a silent-wrong-value problem. Candidates worth spiking,
+     roughly best-fit-first for *this* sub-task specifically:
+     - **DeepSeek-V4 (Flash, free via HF)** — already this user's
+       fallback-chain model, proven tool-call reliability, zero new vendor
+       or cost to introduce.
+     - **MiniMax M2.5** — independently benchmarked (2026) as unusually
+       disciplined at bare, unwrapped JSON output (98.6% quality, 100%
+       format compliance across a 38-task structured-output benchmark) at
+       ~$0.07/run — exactly the profile wanted for a machine-parsed plan
+       manifest with no human reading the raw output.
+     - **GLM 5.1/5.2** — MIT-licensed, structured-coding benchmarks
+       competitive with closed frontier models; fits this user's ongoing
+       provider-consolidation goal (z.AI coding plan evaluation already
+       underway).
+   - **Final template/script emission is a plausible fit for a diffusion
+     code model** (Mercury Coder, LLaDA 2), spiked separately from the
+     labeling step and purely as a latency optimization, not a
+     safety-relevant one. The task at that point — fill in already-verified
+     slot positions in an already-fixed-structure script — is closer to
+     masked inpainting than open-ended left-to-right generation, which is
+     the diffusion-LM architectural strength (bidirectional refinement,
+     revise-any-position, reported 2–10x latency win over autoregressive
+     models at this profile). This is unproven for the slot-*judgment* step
+     specifically (no benchmark evidence yet of diffusion coders reasoning
+     about unit-bearing vs. freely-swappable values) — treat it strictly as
+     an optional final-stage speed optimization once slots are already
+     symbolically verified and labeled, never as a replacement for the
+     verification step above.
+
+   Net effect: a three-stage pipeline where the only stage touching a raw
+   LLM judgment call is the lowest-stakes one.
+
+   ```
+   symbolic diff across ≥2 captured runs   → WHICH positions are slots (no LLM)
+        ↓
+   cheap structured-output LLM              → label/name slots, write JSON manifest
+   (DeepSeek-V4-Flash / MiniMax M2.5 / GLM 5.x)
+        ↓
+   (optional, latency-motivated) diffusion coder → fast final template/script emission
+   (Mercury Coder / LLaDA 2)
+   ```
+
+   This still needs a concrete eval once a prototype exists — the above is
+   a proposed design, not a validated one.
 3. **Does this belong in core `plugins/` at all**, or is it exactly the kind
    of "third-party/niche" capability `CONTRIBUTING.md` says should ship as a
    standalone plugin repo rather than an in-tree PR? Leaning toward:
