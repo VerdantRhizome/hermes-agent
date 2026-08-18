@@ -1,6 +1,10 @@
 # Skill Plan Cache (SPC)
 
-**Status:** DRAFT — workshopping on a fork, not yet opened against upstream.
+**Status:** DRAFT — workshopped on a fork. Decided (2026-08-19): ships as a
+**standalone plugin**, not an in-tree contribution. This document now
+records the plugin's design for future implementation, not a PR intended
+against `NousResearch/hermes-agent` core — see open question #3's
+resolution for the reasoning.
 
 **Author:** Adrien Evian (fork: VerdantRhizome/hermes-agent), drafted with agent
 assistance.
@@ -102,39 +106,61 @@ The prompt only ever appears when the user is already about to run that
 exact skill again, so it is contextually relevant rather than a
 context-switch.
 
-### 2. Storage: inside the skill's own directory, using the existing skill file API
+### 2. Storage: plugin state facade, not the skill's own directory
 
-The template is written via `ctx` calls into the **skill's own**
-`scripts/` or a new sibling `cache/` folder — reusing `skill_manage`'s
-existing `write_file` action and directory allowlist (`references/`,
-`templates/`, `scripts/`, `assets/`), extended to accept a `cache/`
-subfolder for these artifacts. Format: a small JSON manifest (slots, source
-skill version hash, capture date) plus, for the bash/rust/system-binary
-case specifically, the literal script file the agent already generated and
-ran — e.g. `cache/mesh-and-solve.plan.json` referencing
-`scripts/mesh-and-solve.sh`. This is not a new storage subsystem; it's the
-skill's own directory, which already ships scripts today (hand-written, by
-convention) — SPC just automates *capturing* one that the agent already
-wrote live instead of requiring the user to notice and save it manually.
+Superseded 2026-08-19 (see open question #3's resolution): the original
+plan to write into the skill's own `scripts/`/`cache/` folder via
+`skill_manage` was a core-touching design (extending `skill_manage`'s
+write allowlist). Since SPC is now decided as a standalone plugin, use the
+**plugin state facade** instead — `ctx.state`, documented in
+`docs/rfcs/plugin-config-state-bridge.md`, already generally available to
+any plugin with zero core involvement: atomic read-modify-write,
+profile-scoped, quota'd (10 MiB), fail-closed on malformed data.
+
+Recorded runs and promoted plan manifests are both plugin-owned runtime
+data, not user-facing config, so `ctx.state` is the right fit per that
+RFC's own "state vs. config" table. Keyed by skill name:
+
+```python
+recordings = ctx.state.get(f"recordings.{skill_name}", default=[])
+recordings.append(new_run_record)
+ctx.state.set(f"recordings.{skill_name}", recordings)
+
+# On promotion:
+ctx.state.set(f"plans.{skill_name}.{plan_name}", manifest)
+```
+
+The literal script file the agent generated and ran is stored as a string
+field inside the manifest (or, if large, a plugin-owned path under
+`ctx.state.data_dir`) rather than in the skill's own `scripts/` folder.
+This trades away one nice-to-have — a cached plan traveling with the skill
+automatically if a user exports/shares it — for zero core surface, which
+is the right trade for a standalone plugin whose only stable dependency
+should be the `PluginContext` ABC itself.
 
 ### 3. Invalidation
 
-The manifest records a hash of the source `SKILL.md` at capture time. If the
-skill file changes, cached plans under it are marked stale (not deleted) and
-skipped until manually reviewed — the same "fail closed, never silently
-replay a target that could be wrong" posture used for the plugin
-config/state bridge's write validation.
+The manifest records a hash of the source `SKILL.md` at capture time
+(read via normal file access — a plugin can read `~/.hermes/skills/`
+directly, no special API needed). If the skill file changes, cached plans
+under it are marked stale (not deleted) and skipped until manually
+reviewed — the same "fail closed, never silently replay a target that
+could be wrong" posture used for the plugin config/state bridge's write
+validation.
 
-### 4. Replay: explicit CLI command, not automatic
+### 4. Replay: explicit plugin-registered CLI command, not automatic
 
 ```
-hermes skills replay <skill-name> [--plan <name>] -- <substituted args>
+hermes spc replay <skill-name> [--plan <name>] -- <substituted args>
 ```
 
-The agent invokes this the same way it invokes any other `hermes <subcommand>`
-via `terminal` — guided by a short addition to the skill's own instructions
-("if a matching cached plan exists, prefer replaying it over re-deriving the
-procedure"), not a new tool. The command:
+Registered via `ctx.register_cli_command()` — part of the generic plugin
+surface (`CONTRIBUTING.md`), not a core `hermes skills replay`
+subcommand as originally sketched. The agent invokes it the same way it
+invokes any other `hermes <subcommand>` via `terminal` — guided by a short
+addition to the skill's own instructions ("if a matching cached plan
+exists, prefer replaying it over re-deriving the procedure"), not a new
+tool. The command:
 
 1. Loads the plan manifest, resolves slots from the given args (or asks the
    model to resolve them — still cheaper than re-deriving the whole plan).
@@ -152,18 +178,30 @@ Automatic keyword/embedding matching (the actual APC mechanism) is a
 follow-up once there's a corpus of real captured plans to tune matching
 against, not a v0 commitment.
 
-## Why this respects the Footprint Ladder
+## Footprint Ladder note (historical — kept for the reasoning trail)
 
-| Rung | Used? | Why |
+The table below reflects the original in-tree framing and the reasoning
+that led to it. As of open question #3's resolution (2026-08-19), SPC
+ships as a **standalone plugin with zero core surface** — rungs 2-4 are
+now all satisfied entirely *within* the plugin (`ctx.register_cli_command`,
+`ctx.register_hook`, `ctx.state`), not as core additions. Kept here because
+the ladder reasoning is still why the design looks the way it does; it's
+no longer "which rung of core do we touch" but "confirmed: none."
+
+| Rung | Used in-tree? | Why |
 |---|---|---|
-| 1. Extend existing code | Partially | Reuses `skill_manage` write paths, existing auxiliary-model config, existing approval gates |
-| 2. CLI command + skill | **Yes** | `hermes skills replay` + a short skill-text convention |
+| 1. Extend existing code | No | Superseded — see §2/§4 above; uses stable plugin ABI, not core write paths |
+| 2. CLI command + skill | **No core change** | `hermes spc replay` is plugin-registered (`ctx.register_cli_command`), lives in the plugin's own namespace |
 | 3. Service-gated tool | No | Not needed — replay is a shell command, not a structured tool call |
-| 4. Plugin | **Yes** | Recording lives in `on_session_end`/`post_tool_call` hooks; promotion check lives in a pre-invocation hook on skill dispatch, in `~/.hermes/plugins/` |
+| 4. Plugin | **Yes — this is the whole implementation** | Recording (`on_session_end`), promotion check (pre-invocation hook), storage (`ctx.state`), and replay (`ctx.register_cli_command`) are all plugin-owned |
 | 5. MCP server | No | No cross-host reuse case yet |
 | 6. New core tool | **No** | Explicitly rejected — the whole point is to avoid adding schema weight for a capability most users won't exercise |
 
 ## Open questions to workshop before this goes near upstream
+
+Historical framing — see note above the ladder table: SPC is not headed
+upstream as a core contribution. The "open questions" below are kept as
+the design-decision record; items 1-3 are resolved.
 
 1. ~~**Where does the "propose caching this" prompt live**~~ — **RESOLVED,
    2026-08-18.** The original framing (a single choice between
@@ -271,14 +309,52 @@ against, not a v0 commitment.
 
    This still needs a concrete eval once a prototype exists — the above is
    a proposed design, not a validated one.
-3. **Does this belong in core `plugins/` at all**, or is it exactly the kind
-   of "third-party/niche" capability `CONTRIBUTING.md` says should ship as a
-   standalone plugin repo rather than an in-tree PR? Leaning toward:
-   prototype as a standalone plugin first, and only propose folding the CLI
-   subcommand into core if real usage shows the file-write conventions need
-   to be officially blessed (i.e. the `cache/` directory addition to
-   `skill_manage`'s allowlist is the only piece that plausibly needs a core
-   change; everything else can live in the plugin).
+3. ~~**Does this belong in core `plugins/` at all**~~ — **RESOLVED,
+   2026-08-19: standalone plugin, not in-tree.** SPC is exactly the shape
+   `CONTRIBUTING.md` describes for standalone placement — niche, not
+   broadly needed by most users, and durability against a fast-moving core
+   matters more here than it would for something with a maintainer
+   sponsor. Concretely:
+
+   - **No core change required at all**, on reflection — the "one piece
+     that plausibly needs a core change" flagged in the original framing
+     (extending `skill_manage`'s write allowlist with a `cache/`
+     subfolder) turns out to be avoidable. Plan manifests don't need to
+     live physically inside the skill's own directory; they can use the
+     plugin state facade (`ctx.state`, documented in
+     `docs/rfcs/plugin-config-state-bridge.md`) instead — atomic
+     read-modify-write, profile-scoped, quota'd, already generally
+     available to any plugin with zero core involvement. This trades away
+     one nice-to-have (a cached plan traveling with the skill if a user
+     exports/shares it) for a real gain: **zero core surface**, so the
+     plugin has nothing that can break on an upstream refactor beyond the
+     stable `PluginContext` ABC itself.
+   - The CLI replay command doesn't need a core `hermes skills replay`
+     subcommand either — `ctx.register_cli_command()` is already part of
+     the generic plugin surface (`CONTRIBUTING.md`, "Third-Party Product
+     Integrations"), so the plugin registers its own `hermes spc replay`
+     (or similar) entirely within its own namespace.
+   - Recording and promotion hooks (`on_session_end`, the pre-invocation
+     promotion check) use `ctx.register_hook()`, also fully generic —
+     nothing SPC needs is special-cased in core.
+   - Net result: SPC ships as a **standalone plugin repo**
+     (`~/.hermes/plugins/skill-plan-cache/` or a pip entry point),
+     following the exact pattern `CONTRIBUTING.md` lays out for
+     third-party/niche capability, using only `register_hook`,
+     `register_cli_command`, `ctx.state`, and `ctx.get_config`/
+     `ctx.set_config` (per-plugin settings namespace, e.g. which skills
+     have recording opted in) — all stable, already-shipped plugin ABI.
+     If real usage later surfaces a genuine need the plugin surface
+     doesn't cover, that becomes its own narrow, justified request to
+     widen the generic plugin surface (per `CONTRIBUTING.md`'s explicit
+     guidance: "never special-case your plugin in core") — not a
+     standing ask to fold SPC itself into the tree.
+
+   This RFC document now describes the plugin's design, not an in-tree
+   contribution — nothing here is intended to become a PR against
+   `NousResearch/hermes-agent` core. Promoting the plugin (once built) in
+   the Nous Research Discord `#plugins-skills-and-skins` channel, per
+   `CONTRIBUTING.md`, is the intended distribution path.
 4. **Multi-skill plans** — real workflows chain skills (e.g. FreeCAD skill →
    Blender skill). Out of scope for v0; v0 is single-skill only.
 
