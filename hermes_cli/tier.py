@@ -12,14 +12,14 @@ def build_tier_parser(subparsers) -> None:
 
     parser = subparsers.add_parser(
         "tier", help="Switch the whole inference tier (main/fallback/aux/delegation/verify-gate)",
-        description="Manage named inference tiers (paid/free) that switch the whole routing "
+        description="Manage named inference tiers that switch the whole routing "
             "stack as one unit. See references/inference-selector-spec.md in the "
             "hermes-model-routing skill.")
     tier_subparsers = parser.add_subparsers(dest="tier_command")
-    tier_subparsers.add_parser("show", help="Render both tiers and diff against live config")
+    tier_subparsers.add_parser("show", help="Render every tier and diff against live config")
     set_p = tier_subparsers.add_parser("set", help="Apply a tier (refuses on missing credentials)")
-    set_p.add_argument("name", choices=["paid", "free"], help="Tier to apply")
+    set_p.add_argument("name", help="Tier to apply")
     check_p = tier_subparsers.add_parser("check", help="Live-probe every role's model")
-    check_p.add_argument("name", nargs="?", choices=["paid", "free"], default=None,
+    check_p.add_argument("name", nargs="?", default=None,
                           help="Tier to check (default: both)")
     parser.set_defaults(func=cmd_tier)

@@ -26,7 +26,7 @@ def cmd_tier_show(args) -> None:  # noqa: ARG001
     tiers = load_tiers(config)
     active = (config.get("tiers") or {}).get("_active")
     print(f"\n  Active tier (last `hermes tier set`): {active or '(none recorded)'}\n")
-    for name in ("paid", "free"):
+    for name in tiers:
         tier = tiers.get(name) or {}
         print(f"  --- {name} ---")
         for role, value in tier.items():
