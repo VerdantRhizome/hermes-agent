@@ -392,6 +392,7 @@ from hermes_cli.subcommands.claw import build_claw_parser
 from hermes_cli.subcommands.vault import build_vault_parser
 from hermes_cli.subcommands.moa import build_moa_parser
 from hermes_cli.subcommands.fallback import build_fallback_parser
+from hermes_cli.tier import build_tier_parser
 from hermes_cli.subcommands.worktree import build_worktree_parser
 from hermes_cli.subcommands.browser import build_browser_parser
 from hermes_cli.subcommands.secrets import build_secrets_parser
@@ -3373,6 +3374,7 @@ def _build_cli_parser():
     build_model_parser(subparsers, cmd_model=cmd_model)
     build_moa_parser(subparsers)
     build_fallback_parser(subparsers)
+    build_tier_parser(subparsers)
     build_worktree_parser(subparsers)
     build_browser_parser(subparsers)
     build_secrets_parser(subparsers)
